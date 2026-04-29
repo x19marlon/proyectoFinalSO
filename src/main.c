@@ -1,8 +1,20 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 int main(){
 
+
+      printf("Iniciando...\n");
+    sleep(1);
+
+    printf("Cargando datos...\n");
+    sleep(2);
+
+    printf("Presiona Enter para continuar...");
+    getchar();
+
+    printf("Bienvenido!\n");
 
     printf("\033[1;34m"); 
 printf(
