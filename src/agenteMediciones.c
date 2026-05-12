@@ -7,9 +7,14 @@
 #include <semaphore.h>
 
 #include "agenteMediciones.h"
+
+#define CARPETA_DOCS "docs"
+
+void construirRutaArchivo(const char *archivoEntrada, char *rutaArchivo, int tamRuta);
+
 int main(int argc, char *argv[]) {
 
-	Estacion estaciones[MAX_ESTACIONES];
+    Estacion estaciones[MAX_ESTACIONES];
 
     char *archivo = NULL;
     char *tiempo = NULL;
@@ -34,21 +39,31 @@ int main(int argc, char *argv[]) {
                 break;
 
             default:
-                printf("Uso: %s -f archivo.csv -t tiempo -p nombre_pipe\n", argv[0]);
+                printf("Uso: %s -f archivo.cvs -t tiempo -p nombre_pipe\n", argv[0]);
                 return 1;
         }
     }
-	bool cvs=verificarArchivo(archivo);
 
+    if (archivo == NULL) {
+        printf("Error: falta la bandera -f con el archivo.\n");
+        return 1;
+    }
 
+    bool cvs = verificarArchivo(archivo);
 
-    if (archivo == NULL || !cvs) {
-        printf("Error: Nombre archivo invalido.\n");
+    if (!cvs) {
+        printf("Error: Nombre archivo invalido. Debe terminar en .cvs\n");
+        return 1;
+    }
+
+    if (tiempo == NULL) {
+        printf("Error: falta la bandera -t con el tiempo.\n");
         return 1;
     }
 
     int tiempoEntero = atoi(tiempo);
-    if (tiempo == NULL || tiempoEntero < 0) {
+
+    if (tiempoEntero < 0) {
         printf("Error: Tiempo inválido.\n");
         return 1;
     }
@@ -58,28 +73,33 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if(strlen(pipe_nombre)> MAX_RUTA_PIPE) {
-		printf("Error: Nombre pipe invalido");
-		return 1;
-	}
+    if (strlen(pipe_nombre) >= MAX_RUTA_PIPE) {
+        printf("Error: Nombre pipe invalido\n");
+        return 1;
+    }
 
-	if(strlen(archivo)> MAX_NOMBRE_ARCHIVO) {
-		printf("Error: Nombre pipe invalido");
-		return 1;
-	}
+    if (strlen(archivo) >= MAX_NOMBRE_ARCHIVO) {
+        printf("Error: Nombre archivo invalido\n");
+        return 1;
+    }
 
-    printf("Archivo CSV: %s\n", archivo);
+    char rutaArchivo[MAX_NOMBRE_ARCHIVO];
+
+    construirRutaArchivo(archivo, rutaArchivo, sizeof(rutaArchivo));
+
+    printf("Archivo recibido: %s\n", archivo);
+    printf("Ruta usada: %s\n", rutaArchivo);
     printf("Tiempo: %s\n", tiempo);
     printf("Pipe: %s\n", pipe_nombre);
 
-    int cantidad = leerCSV(archivo, estaciones);
+    int cantidad = leerCSV(rutaArchivo, estaciones);
 
     if (cantidad == -1) {
         printf("Error leyendo el archivo CSV.\n");
         return 1;
     }
 
-  if (enviarLecturaPorPipe(pipe_nombre, estaciones, cantidad, tiempoEntero) == -1) {
+    if (enviarLecturaPorPipe(pipe_nombre, estaciones, cantidad, tiempoEntero) == -1) {
         printf("Error enviando lecturas por el pipe.\n");
         return 1;
     }
@@ -89,19 +109,41 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-//  Esta funcion verifica que los ultimos caracteres de archivo sean de las extension cvs
-bool verificarArchivo(const char *archivo){
+void construirRutaArchivo(const char *archivoEntrada, char *rutaArchivo, int tamRuta) {
 
+    /*
+        Si archivoEntrada ya tiene una ruta, por ejemplo:
+        docs/lluvioso.cvs
+        /home/usuario/docs/lluvioso.cvs
 
-	int s = strlen(archivo)-1;
-	int v = strlen(archivo)-2;
-	int c = strlen(archivo)-3;
+        entonces se usa tal cual.
 
-	if(archivo[c] == 'c'&& archivo[v] == 'v'&& archivo[s] == 's') return true;
-	else return false;
+        Si solo viene el nombre:
+        lluvioso.cvs
 
+        entonces se convierte en:
+        docs/lluvioso.cvs
+    */
 
+    if (strchr(archivoEntrada, '/') != NULL) {
+        snprintf(rutaArchivo, tamRuta, "%s", archivoEntrada);
+    } else {
+        snprintf(rutaArchivo, tamRuta, "%s/%s", CARPETA_DOCS, archivoEntrada);
+    }
 }
+
+// Esta funcion verifica que el archivo termine en .cvs
+bool verificarArchivo(const char *archivo) {
+
+    int longitud = strlen(archivo);
+
+    if (longitud < 4) {
+        return false;
+    }
+
+    return strcmp(archivo + longitud - 4, ".cvs") == 0;
+}
+
 // Esta funcion lee cvs
 int leerCSV(const char *nombreArchivo, Estacion estaciones[]) {
     FILE *archivo = fopen(nombreArchivo, "r");
@@ -116,28 +158,23 @@ int leerCSV(const char *nombreArchivo, Estacion estaciones[]) {
 
     while (fgets(linea, sizeof(linea), archivo) != NULL) {
 
-        // Quitar salto de línea '\n'
         linea[strcspn(linea, "\n")] = '\0';
 
-        // Si la línea es ".", se detiene la lectura
         if (strcmp(linea, ".") == 0) {
             break;
         }
 
-        // Separar la línea por comas
         char *nombre = strtok(linea, ",");
         char *humedad = strtok(NULL, ",");
         char *rocio = strtok(NULL, ",");
         char *presion = strtok(NULL, ",");
         char *hora = strtok(NULL, ",");
 
-        // Validar que la línea tenga todos los datos
         if (nombre == NULL || humedad == NULL || rocio == NULL || presion == NULL || hora == NULL) {
             printf("Línea inválida, se ignora.\n");
             continue;
         }
 
-        // Guardar los datos en el arreglo de structs
         strcpy(estaciones[cantidad].nombreEstacion, nombre);
         estaciones[cantidad].humedad = atoi(humedad);
         estaciones[cantidad].rocio = atoi(rocio);
