@@ -1,346 +1,517 @@
-// Librería estándar de entrada y salida.
-// Se usa para printf, perror, fopen, fgets, fclose, etc.
-#include <stdio.h>
+#include "monitor.h"
 
-// Librería estándar de utilidades.
-// Se usa para atoi, que convierte cadenas a enteros.
 #include <stdlib.h>
-
-// Librería POSIX.
-// Se usa para getopt, sleep, write y close.
 #include <unistd.h>
-
-// Librería para manejo de cadenas.
-// Se usa para strlen, strcmp, strcpy, strtok, strchr, snprintf, etc.
-#include <string.h>
-
-// Librería para usar el tipo bool, junto con true y false.
-#include <stdbool.h>
-
-// Librería para abrir archivos o pipes con open.
-// También permite usar banderas como O_WRONLY.
 #include <fcntl.h>
-
-// Librería para usar semáforos POSIX nombrados.
+#include <sys/stat.h>
+#include <string.h>
+#include <errno.h>
 #include <semaphore.h>
 
-// Archivo de cabecera propio del agente.
-// Allí deberían estar las constantes, la estructura Estacion y prototipos.
-#include "agenteMediciones.h"
-
-// Define la carpeta por defecto donde se buscan los archivos .cvs.
-// Si el usuario solo pasa "lluvioso.cvs", el programa buscará "docs/lluvioso.cvs".
-#define CARPETA_DOCS "docs"
-
-// Prototipo de la función que construye la ruta completa del archivo.
-void construirRutaArchivo(const char *archivoEntrada, char *rutaArchivo, int tamRuta);
-
 int main(int argc, char *argv[]) {
+    int tamBuffer;
+    char rutaPipe[MAX_RUTA_PIPE];
 
-    // Arreglo donde se almacenan las mediciones leídas del archivo .cvs.
-    Estacion estaciones[MAX_ESTACIONES];
-
-    // Punteros para guardar los valores recibidos por consola.
-    // archivo corresponde a -f.
-    // tiempo corresponde a -t.
-    // pipe_nombre corresponde a -p.
-    char *archivo = NULL;
-    char *tiempo = NULL;
-    char *pipe_nombre = NULL;
-
-    // Variable donde getopt guardará la opción leída.
-    int opcion;
-
-    // getopt procesa las banderas -f, -t y -p.
-    // Los dos puntos indican que cada bandera espera un argumento.
-    while ((opcion = getopt(argc, argv, "f:t:p:")) != -1) {
-
-        switch (opcion) {
-
-            // Bandera -f: nombre del archivo .cvs.
-            case 'f':
-                archivo = optarg;
-                break;
-
-            // Bandera -t: tiempo de espera entre lecturas.
-            case 't':
-                tiempo = optarg;
-                break;
-
-            // Bandera -p: nombre del pipe nominal.
-            case 'p':
-                pipe_nombre = optarg;
-                break;
-
-            // Si llega una bandera no reconocida o mal usada, se muestra el uso correcto.
-            default:
-                printf("Uso: %s -f archivo.cvs -t tiempo -p nombre_pipe\n", argv[0]);
-                return 1;
-        }
-    }
-
-    // Valida que el usuario haya enviado la bandera -f.
-    if (archivo == NULL) {
-        printf("Error: falta la bandera -f con el archivo.\n");
+    if (leerArgumentosMonitor(argc, argv, &tamBuffer, rutaPipe) == -1) {
+        printf("Uso: %s -b tamBuffer -p nombre_pipe\n", argv[0]);
         return 1;
     }
 
-    // Verifica que el archivo termine en .cvs.
-    bool cvs = verificarArchivo(archivo);
+    /*
+        Reiniciamos el semáforo por si quedó creado de una ejecución anterior.
+        Esto evita problemas si el programa se cerró de forma inesperada.
+    */
+    sem_unlink(NOMBRE_SEMAFORO);
 
-    // Si el archivo no tiene extensión válida, termina el programa.
-    if (!cvs) {
-        printf("Error: Nombre archivo invalido. Debe terminar en .cvs\n");
+    sem_t *semaforo = sem_open(NOMBRE_SEMAFORO, O_CREAT, 0666, 1);
+
+    if (semaforo == SEM_FAILED) {
+        perror("Error creando semáforo");
         return 1;
     }
 
-    // Valida que el usuario haya enviado la bandera -t.
-    if (tiempo == NULL) {
-        printf("Error: falta la bandera -t con el tiempo.\n");
+    if (crearPipeNominal(rutaPipe) == -1) {
+        sem_close(semaforo);
+        sem_unlink(NOMBRE_SEMAFORO);
         return 1;
     }
 
-    // Convierte el tiempo recibido como texto a entero.
-    int tiempoEntero = atoi(tiempo);
+    FILE *archivoConsolidado = fopen(ARCHIVO_CONSOLIDADO, "w");
 
-    // Valida que el tiempo no sea negativo.
-    if (tiempoEntero < 0) {
-        printf("Error: Tiempo inválido.\n");
+    if (archivoConsolidado == NULL) {
+        perror("Error creando archivo consolidado");
+        sem_close(semaforo);
+        sem_unlink(NOMBRE_SEMAFORO);
         return 1;
     }
 
-    // Valida que el usuario haya enviado la bandera -p.
-    if (pipe_nombre == NULL) {
-        printf("Error: falta la bandera -p con el nombre del pipe\n");
+    fprintf(
+        archivoConsolidado,
+        "tipo,nombreEstacion,humedad,rocio,presion,hora\n"
+    );
+
+    MonitorContext contexto;
+
+    strcpy(contexto.rutaPipe, rutaPipe);
+    contexto.archivoConsolidado = archivoConsolidado;
+
+    inicializarBuffer(&contexto.buffer, tamBuffer);
+    inicializarEstadisticas(&contexto.estadisticas);
+    inicializarConteoCategorias(&contexto.conteoCategorias);
+
+    pthread_t recolector;
+    pthread_t procesador;
+
+    printf("Monitor esperando datos en: %s\n", rutaPipe);
+    printf("Tamaño del buffer: %d lecturas\n", tamBuffer);
+
+    if (pthread_create(&procesador, NULL, hiloProcesador, &contexto) != 0) {
+        printf("Error creando Hilo Procesador.\n");
+
+        destruirBuffer(&contexto.buffer);
+        fclose(archivoConsolidado);
+        sem_close(semaforo);
+        sem_unlink(NOMBRE_SEMAFORO);
+
         return 1;
     }
 
-    // Valida que el nombre del pipe no supere el tamaño máximo permitido.
-    if (strlen(pipe_nombre) >= MAX_RUTA_PIPE) {
-        printf("Error: Nombre pipe invalido\n");
+    if (pthread_create(&recolector, NULL, hiloRecolector, &contexto) != 0) {
+        printf("Error creando Hilo Recolector.\n");
+
+        finalizarBuffer(&contexto.buffer);
+        pthread_join(procesador, NULL);
+
+        destruirBuffer(&contexto.buffer);
+        fclose(archivoConsolidado);
+        sem_close(semaforo);
+        sem_unlink(NOMBRE_SEMAFORO);
+
         return 1;
     }
 
-    // Valida que el nombre del archivo no supere el tamaño máximo permitido.
-    if (strlen(archivo) >= MAX_NOMBRE_ARCHIVO) {
-        printf("Error: Nombre archivo invalido\n");
-        return 1;
-    }
+    pthread_join(recolector, NULL);
+    pthread_join(procesador, NULL);
 
-    // Arreglo donde se guardará la ruta final del archivo.
-    // Puede ser una ruta recibida directamente o una ruta construida con docs/.
-    char rutaArchivo[MAX_NOMBRE_ARCHIVO];
+    fclose(archivoConsolidado);
 
-    // Construye la ruta del archivo a leer.
-    construirRutaArchivo(archivo, rutaArchivo, sizeof(rutaArchivo));
+    printf("\nArchivo consolidado creado: %s\n", ARCHIVO_CONSOLIDADO);
 
-    // Imprime información de configuración para verificar la ejecución.
-    printf("Archivo recibido: %s\n", archivo);
-    printf("Ruta usada: %s\n", rutaArchivo);
-    printf("Tiempo: %s\n", tiempo);
-    printf("Pipe: %s\n", pipe_nombre);
+    imprimirResumen(contexto.estadisticas);
+    imprimirCategorias(contexto.conteoCategorias);
 
-    // Lee el archivo .cvs y guarda las mediciones en el arreglo estaciones.
-    int cantidad = leerCSV(rutaArchivo, estaciones);
+    destruirBuffer(&contexto.buffer);
 
-    // Si leerCSV retorna -1, hubo error al abrir o leer el archivo.
-    if (cantidad == -1) {
-        printf("Error leyendo el archivo CSV.\n");
-        return 1;
-    }
+    sem_close(semaforo);
+    sem_unlink(NOMBRE_SEMAFORO);
 
-    // Envía las lecturas almacenadas al Monitor usando el pipe nominal.
-    // También se pasa el tiempo para esperar entre lectura y lectura.
-    if (enviarLecturaPorPipe(pipe_nombre, estaciones, cantidad, tiempoEntero) == -1) {
-        printf("Error enviando lecturas por el pipe.\n");
-        return 1;
-    }
-
-    // Mensaje final si todo salió correctamente.
-    printf("Lecturas enviadas correctamente.\n");
+    unlink(rutaPipe);
 
     return 0;
 }
 
-void construirRutaArchivo(const char *archivoEntrada, char *rutaArchivo, int tamRuta) {
+int leerArgumentosMonitor(
+    int argc,
+    char *argv[],
+    int *tamBuffer,
+    char *rutaPipe
+) {
+    char *pipeNombre = NULL;
+    *tamBuffer = 0;
 
-    /*
-        Si archivoEntrada ya tiene una ruta, por ejemplo:
-        docs/lluvioso.cvs
-        /home/usuario/docs/lluvioso.cvs
+    int opcion;
 
-        entonces se usa tal cual.
+    while ((opcion = getopt(argc, argv, "b:p:")) != -1) {
+        switch (opcion) {
+            case 'b':
+                *tamBuffer = atoi(optarg);
+                break;
 
-        Si solo viene el nombre:
-        lluvioso.cvs
+            case 'p':
+                pipeNombre = optarg;
+                break;
 
-        entonces se convierte en:
-        docs/lluvioso.cvs
-    */
-
-    // strchr busca si el texto contiene el carácter '/'.
-    // Si lo contiene, se asume que el usuario ya pasó una ruta.
-    if (strchr(archivoEntrada, '/') != NULL) {
-        snprintf(rutaArchivo, tamRuta, "%s", archivoEntrada);
-    } else {
-        // Si no contiene '/', se construye la ruta dentro de la carpeta docs.
-        snprintf(rutaArchivo, tamRuta, "%s/%s", CARPETA_DOCS, archivoEntrada);
+            default:
+                return -1;
+        }
     }
+
+    if (*tamBuffer <= 0 || pipeNombre == NULL) {
+        return -1;
+    }
+
+    int resultado = snprintf(rutaPipe, MAX_RUTA_PIPE, "/tmp/%s", pipeNombre);
+
+    if (resultado < 0 || resultado >= MAX_RUTA_PIPE) {
+        printf("Error: nombre de pipe demasiado largo.\n");
+        return -1;
+    }
+
+    return 0;
 }
 
-// Esta función verifica que el archivo termine en .cvs.
-bool verificarArchivo(const char *archivo) {
+int crearPipeNominal(const char *rutaPipe) {
+    if (mkfifo(rutaPipe, 0666) == -1) {
+        if (errno != EEXIST) {
+            perror("Error creando pipe nominal");
+            return -1;
+        }
+    }
 
-    // Calcula la longitud del nombre del archivo.
-    int longitud = strlen(archivo);
+    return 0;
+}
 
-    // Si tiene menos de 4 caracteres, no puede terminar en ".cvs".
-    if (longitud < 4) {
+void inicializarBuffer(BufferEstaciones *buffer, int capacidad) {
+    buffer->datos = malloc(sizeof(Estacion) * capacidad);
+
+    if (buffer->datos == NULL) {
+        perror("Error reservando memoria para el buffer");
+        exit(1);
+    }
+
+    buffer->capacidad = capacidad;
+    buffer->inicio = 0;
+    buffer->fin = 0;
+    buffer->cantidad = 0;
+    buffer->terminado = 0;
+
+    pthread_mutex_init(&buffer->mutex, NULL);
+    pthread_cond_init(&buffer->noLleno, NULL);
+    pthread_cond_init(&buffer->noVacio, NULL);
+}
+
+void destruirBuffer(BufferEstaciones *buffer) {
+    free(buffer->datos);
+
+    pthread_mutex_destroy(&buffer->mutex);
+    pthread_cond_destroy(&buffer->noLleno);
+    pthread_cond_destroy(&buffer->noVacio);
+}
+
+void insertarBuffer(BufferEstaciones *buffer, Estacion estacion) {
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->cantidad == buffer->capacidad) {
+        pthread_cond_wait(&buffer->noLleno, &buffer->mutex);
+    }
+
+    buffer->datos[buffer->fin] = estacion;
+    buffer->fin = (buffer->fin + 1) % buffer->capacidad;
+    buffer->cantidad++;
+
+    pthread_cond_signal(&buffer->noVacio);
+    pthread_mutex_unlock(&buffer->mutex);
+}
+
+bool sacarBuffer(BufferEstaciones *buffer, Estacion *estacion) {
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->cantidad == 0 && !buffer->terminado) {
+        pthread_cond_wait(&buffer->noVacio, &buffer->mutex);
+    }
+
+    if (buffer->cantidad == 0 && buffer->terminado) {
+        pthread_mutex_unlock(&buffer->mutex);
         return false;
     }
 
-    // Compara los últimos 4 caracteres del nombre con ".cvs".
-    return strcmp(archivo + longitud - 4, ".cvs") == 0;
+    *estacion = buffer->datos[buffer->inicio];
+    buffer->inicio = (buffer->inicio + 1) % buffer->capacidad;
+    buffer->cantidad--;
+
+    pthread_cond_signal(&buffer->noLleno);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return true;
 }
 
-// Esta función lee el archivo .cvs y guarda cada línea válida en el arreglo estaciones.
-int leerCSV(const char *nombreArchivo, Estacion estaciones[]) {
-    // Abre el archivo en modo lectura.
-    FILE *archivo = fopen(nombreArchivo, "r");
+void finalizarBuffer(BufferEstaciones *buffer) {
+    pthread_mutex_lock(&buffer->mutex);
 
-    // Si fopen devuelve NULL, el archivo no pudo abrirse.
-    if (archivo == NULL) {
-        perror("Error al abrir el archivo");
-        return -1;
+    buffer->terminado = 1;
+
+    pthread_cond_broadcast(&buffer->noVacio);
+
+    pthread_mutex_unlock(&buffer->mutex);
+}
+
+void *hiloRecolector(void *arg) {
+    MonitorContext *contexto = (MonitorContext *) arg;
+
+    int fdPipe = open(contexto->rutaPipe, O_RDONLY);
+
+    if (fdPipe == -1) {
+        perror("Error abriendo pipe en Hilo Recolector");
+        finalizarBuffer(&contexto->buffer);
+        pthread_exit(NULL);
     }
 
-    // Arreglo temporal para guardar cada línea leída del archivo.
+    FILE *pipe = fdopen(fdPipe, "r");
+
+    if (pipe == NULL) {
+        perror("Error convirtiendo pipe a FILE en Hilo Recolector");
+        close(fdPipe);
+        finalizarBuffer(&contexto->buffer);
+        pthread_exit(NULL);
+    }
+
     char linea[MAX_LINEA];
 
-    // Contador de mediciones válidas leídas.
-    int cantidad = 0;
-
-    // Lee el archivo línea por línea.
-    while (fgets(linea, sizeof(linea), archivo) != NULL) {
-
-        // Elimina el salto de línea '\n' si existe.
+    while (fgets(linea, sizeof(linea), pipe) != NULL) {
         linea[strcspn(linea, "\n")] = '\0';
 
-        // Si la línea es ".", se interpreta como fin de archivo lógico.
-        if (strcmp(linea, ".") == 0) {
-            break;
-        }
+        Estacion estacion;
 
-        // Separa la línea usando coma como delimitador.
-        char *nombre = strtok(linea, ",");
-        char *humedad = strtok(NULL, ",");
-        char *rocio = strtok(NULL, ",");
-        char *presion = strtok(NULL, ",");
-        char *hora = strtok(NULL, ",");
-
-        // Valida que la línea tenga todos los campos esperados.
-        if (nombre == NULL || humedad == NULL || rocio == NULL || presion == NULL || hora == NULL) {
-            printf("Línea inválida, se ignora.\n");
+        if (!convertirLineaAEstacion(linea, &estacion)) {
+            printf("Línea inválida recibida: %s\n", linea);
             continue;
         }
 
-        // Copia el nombre de la estación dentro de la estructura.
-        strcpy(estaciones[cantidad].nombreEstacion, nombre);
-
-        // Convierte los valores numéricos de texto a entero.
-        estaciones[cantidad].humedad = atoi(humedad);
-        estaciones[cantidad].rocio = atoi(rocio);
-        estaciones[cantidad].presion = atoi(presion);
-
-        // Copia la hora dentro de la estructura.
-        strcpy(estaciones[cantidad].hora, hora);
-
-        // Aumenta la cantidad de mediciones válidas.
-        cantidad++;
-
-        // Evita superar el tamaño máximo del arreglo de estaciones.
-        if (cantidad >= MAX_ESTACIONES) {
-            printf("Se alcanzó el máximo de estaciones.\n");
-            break;
-        }
-    }
-
-    // Cierra el archivo después de leerlo.
-    fclose(archivo);
-
-    // Retorna cuántas mediciones válidas se leyeron.
-    return cantidad;
-}
-
-// Esta función envía las lecturas al Monitor por medio del pipe nominal.
-int enviarLecturaPorPipe(const char* nombrePipe, Estacion estaciones[], int cantidad, int tiempoSegundos) {
-    // Ruta completa del pipe nominal.
-    char rutaPipe[MAX_RUTA_PIPE];
-
-    // Construye la ruta del pipe en /tmp.
-    snprintf(rutaPipe, sizeof(rutaPipe), "/tmp/%s", nombrePipe);
-
-    // Abre el pipe nominal solo para escritura.
-    int fdPipe = open(rutaPipe, O_WRONLY);
-
-    // Si open retorna -1, no se pudo abrir el pipe.
-    if (fdPipe == -1) {
-        perror("Error abriendo el pipe nominal");
-        return -1;
-    }
-
-    // Abre el semáforo nombrado creado por el Monitor.
-    sem_t *semaforo = sem_open(NOMBRE_SEMAFORO, 0);
-
-    // Si SEM_FAILED, el semáforo no existe o no pudo abrirse.
-    if (semaforo == SEM_FAILED) {
-        perror("Error abriendo el semáforo");
-        close(fdPipe);
-        return -1;
-    }
-
-    // Recorre todas las mediciones leídas del archivo.
-    for (int i = 0; i < cantidad; i++) {
-        // Mensaje que se enviará por el pipe.
-        char mensaje[MAX_LINEA];
-
-        // Convierte la estructura Estacion nuevamente a una línea tipo CSV.
-        snprintf(
-            mensaje,
-            sizeof(mensaje),
-            "%s,%d,%d,%d,%s\n",
-            estaciones[i].nombreEstacion,
-            estaciones[i].humedad,
-            estaciones[i].rocio,
-            estaciones[i].presion,
-            estaciones[i].hora
+        printf(
+            "[Recolector] Lectura recibida: %s,%d,%d,%d,%s\n",
+            estacion.nombreEstacion,
+            estacion.humedad,
+            estacion.rocio,
+            estacion.presion,
+            estacion.hora
         );
 
-        // Entrada a la sección crítica.
-        // Solo un agente puede escribir al pipe a la vez.
-        sem_wait(semaforo);
-
-        // Envía la línea al pipe nominal.
-        write(fdPipe, mensaje, strlen(mensaje));
-
-        // Salida de la sección crítica.
-        // Libera el semáforo para que otro agente pueda escribir.
-        sem_post(semaforo);
-
-        // Muestra en terminal la lectura enviada.
-        printf("Lectura enviada: %s", mensaje);
-
-        // Espera el número de segundos indicado por -t antes de enviar la siguiente lectura.
-        if (i < cantidad - 1) {
-            sleep(tiempoSegundos);
-        }
+        insertarBuffer(&contexto->buffer, estacion);
     }
 
-    // Cierra el semáforo en este proceso.
-    sem_close(semaforo);
+    fclose(pipe);
 
-    // Cierra el descriptor del pipe.
-    close(fdPipe);
+    finalizarBuffer(&contexto->buffer);
 
-    return 0;
+    pthread_exit(NULL);
+}
+
+void *hiloProcesador(void *arg) {
+    MonitorContext *contexto = (MonitorContext *) arg;
+
+    Estacion estacion;
+
+    while (sacarBuffer(&contexto->buffer, &estacion)) {
+        printf(
+            "[Procesador] Procesando: %s,%d,%d,%d,%s\n",
+            estacion.nombreEstacion,
+            estacion.humedad,
+            estacion.rocio,
+            estacion.presion,
+            estacion.hora
+        );
+
+        fprintf(
+            contexto->archivoConsolidado,
+            "LECTURA,%s,%d,%d,%d,%s\n",
+            estacion.nombreEstacion,
+            estacion.humedad,
+            estacion.rocio,
+            estacion.presion,
+            estacion.hora
+        );
+
+        fflush(contexto->archivoConsolidado);
+
+        actualizarEstadisticas(&contexto->estadisticas, estacion);
+        clasificarLectura(estacion, &contexto->conteoCategorias);
+    }
+
+    pthread_exit(NULL);
+}
+
+int convertirLineaAEstacion(const char *linea, Estacion *estacion) {
+    char copia[MAX_LINEA];
+
+    strncpy(copia, linea, sizeof(copia));
+    copia[sizeof(copia) - 1] = '\0';
+
+    char *nombre = strtok(copia, ",");
+    char *humedad = strtok(NULL, ",");
+    char *rocio = strtok(NULL, ",");
+    char *presion = strtok(NULL, ",");
+    char *hora = strtok(NULL, ",");
+
+    if (nombre == NULL ||
+        humedad == NULL ||
+        rocio == NULL ||
+        presion == NULL ||
+        hora == NULL) {
+
+        return 0;
+    }
+
+    strncpy(estacion->nombreEstacion, nombre, sizeof(estacion->nombreEstacion));
+    estacion->nombreEstacion[sizeof(estacion->nombreEstacion) - 1] = '\0';
+
+    estacion->humedad = atoi(humedad);
+    estacion->rocio = atoi(rocio);
+    estacion->presion = atoi(presion);
+
+    strncpy(estacion->hora, hora, sizeof(estacion->hora));
+    estacion->hora[sizeof(estacion->hora) - 1] = '\0';
+
+    return 1;
+}
+
+void inicializarEstadisticas(Estadisticas *estadisticas) {
+    estadisticas->cantidad = 0;
+
+    estadisticas->sumaHumedad = 0;
+    estadisticas->sumaRocio = 0;
+    estadisticas->sumaPresion = 0;
+
+    estadisticas->minHumedad = 0;
+    estadisticas->maxHumedad = 0;
+
+    estadisticas->minRocio = 0;
+    estadisticas->maxRocio = 0;
+
+    estadisticas->minPresion = 0;
+    estadisticas->maxPresion = 0;
+}
+
+void actualizarEstadisticas(Estadisticas *estadisticas, Estacion estacion) {
+    if (estadisticas->cantidad == 0) {
+        estadisticas->minHumedad = estacion.humedad;
+        estadisticas->maxHumedad = estacion.humedad;
+
+        estadisticas->minRocio = estacion.rocio;
+        estadisticas->maxRocio = estacion.rocio;
+
+        estadisticas->minPresion = estacion.presion;
+        estadisticas->maxPresion = estacion.presion;
+    }
+
+    estadisticas->sumaHumedad += estacion.humedad;
+    estadisticas->sumaRocio += estacion.rocio;
+    estadisticas->sumaPresion += estacion.presion;
+
+    if (estacion.humedad < estadisticas->minHumedad) {
+        estadisticas->minHumedad = estacion.humedad;
+    }
+
+    if (estacion.humedad > estadisticas->maxHumedad) {
+        estadisticas->maxHumedad = estacion.humedad;
+    }
+
+    if (estacion.rocio < estadisticas->minRocio) {
+        estadisticas->minRocio = estacion.rocio;
+    }
+
+    if (estacion.rocio > estadisticas->maxRocio) {
+        estadisticas->maxRocio = estacion.rocio;
+    }
+
+    if (estacion.presion < estadisticas->minPresion) {
+        estadisticas->minPresion = estacion.presion;
+    }
+
+    if (estacion.presion > estadisticas->maxPresion) {
+        estadisticas->maxPresion = estacion.presion;
+    }
+
+    estadisticas->cantidad++;
+}
+
+void imprimirResumen(Estadisticas estadisticas) {
+    if (estadisticas.cantidad == 0) {
+        printf("No se recibieron datos para calcular estadísticas.\n");
+        return;
+    }
+
+    double promedioHumedad = (double) estadisticas.sumaHumedad / estadisticas.cantidad;
+    double promedioRocio = (double) estadisticas.sumaRocio / estadisticas.cantidad;
+    double promedioPresion = (double) estadisticas.sumaPresion / estadisticas.cantidad;
+
+    printf("\n===== RESUMEN DE MEDICIONES =====\n");
+
+    printf("Cantidad de lecturas procesadas: %d\n", estadisticas.cantidad);
+
+    printf("\nHumedad:\n");
+    printf("  Promedio: %.2f\n", promedioHumedad);
+    printf("  Mínimo: %d\n", estadisticas.minHumedad);
+    printf("  Máximo: %d\n", estadisticas.maxHumedad);
+
+    printf("\nRocío:\n");
+    printf("  Promedio: %.2f\n", promedioRocio);
+    printf("  Mínimo: %d\n", estadisticas.minRocio);
+    printf("  Máximo: %d\n", estadisticas.maxRocio);
+
+    printf("\nPresión:\n");
+    printf("  Promedio: %.2f\n", promedioPresion);
+    printf("  Mínimo: %d\n", estadisticas.minPresion);
+    printf("  Máximo: %d\n", estadisticas.maxPresion);
+
+    printf("=================================\n");
+}
+
+void inicializarConteoCategorias(ConteoCategorias *conteo) {
+    conteo->lluvioso = 0;
+    conteo->nublado = 0;
+    conteo->fresco = 0;
+    conteo->sinCategoria = 0;
+}
+
+void clasificarLectura(Estacion estacion, ConteoCategorias *conteo) {
+    if (estacion.humedad > 90 &&
+        estacion.rocio > 9 &&
+        estacion.presion < 750) {
+
+        conteo->lluvioso++;
+        return;
+    }
+
+    if (estacion.humedad >= 80 &&
+        estacion.humedad <= 95 &&
+        estacion.rocio > 8 &&
+        estacion.presion == 751) {
+
+        conteo->nublado++;
+        return;
+    }
+
+    if (estacion.humedad < 80 &&
+        estacion.rocio >= 5 &&
+        estacion.rocio <= 8 &&
+        estacion.presion > 754) {
+
+        conteo->fresco++;
+        return;
+    }
+
+    conteo->sinCategoria++;
+}
+
+void imprimirCategorias(ConteoCategorias conteo) {
+    printf("\n===== CATEGORIZACIÓN METEOROLÓGICA =====\n");
+
+    printf("Lecturas lluviosas: %d\n", conteo.lluvioso);
+    printf("Lecturas nubladas: %d\n", conteo.nublado);
+    printf("Lecturas frescas: %d\n", conteo.fresco);
+    printf("Lecturas sin categoría: %d\n", conteo.sinCategoria);
+
+    printf("\nCategoría predominante: ");
+
+    if (conteo.lluvioso == 0 &&
+        conteo.nublado == 0 &&
+        conteo.fresco == 0) {
+
+        printf("No categorizado\n");
+    }
+    else if (conteo.lluvioso >= conteo.nublado &&
+             conteo.lluvioso >= conteo.fresco) {
+
+        printf("Lluvioso\n");
+    }
+    else if (conteo.nublado >= conteo.lluvioso &&
+             conteo.nublado >= conteo.fresco) {
+
+        printf("Nublado\n");
+    }
+    else {
+        printf("Fresco\n");
+    }
+
+    printf("========================================\n");
 }
