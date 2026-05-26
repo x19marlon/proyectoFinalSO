@@ -12,17 +12,16 @@ int main(int argc, char *argv[]) {
     int tamBuffer;
     char rutaPipe[MAX_RUTA_PIPE];
 
+    // Lee los argumentos del programa: tamaño del buffer y nombre del pipe.
     if (leerArgumentosMonitor(argc, argv, &tamBuffer, rutaPipe) == -1) {
         printf("Uso: %s -b tamBuffer -p nombre_pipe\n", argv[0]);
         return 1;
     }
 
-    /*
-        Reiniciamos el semáforo por si quedó creado de una ejecución anterior.
-        Esto evita problemas si el programa se cerró de forma inesperada.
-    */
+    // Reinicia el semáforo por si quedó creado en una ejecución anterior.
     sem_unlink(NOMBRE_SEMAFORO);
 
+    // Crea un semáforo nombrado con valor inicial 1.
     sem_t *semaforo = sem_open(NOMBRE_SEMAFORO, O_CREAT, 0666, 1);
 
     if (semaforo == SEM_FAILED) {
@@ -30,12 +29,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Crea el pipe nominal donde el monitor recibirá las lecturas.
     if (crearPipeNominal(rutaPipe) == -1) {
         sem_close(semaforo);
         sem_unlink(NOMBRE_SEMAFORO);
         return 1;
     }
 
+    // Crea el archivo CSV donde se consolidarán las lecturas procesadas.
     FILE *archivoConsolidado = fopen(ARCHIVO_CONSOLIDADO, "w");
 
     if (archivoConsolidado == NULL) {
@@ -45,16 +46,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Encabezado del archivo CSV.
     fprintf(
         archivoConsolidado,
         "tipo,nombreEstacion,humedad,rocio,presion,hora\n"
     );
 
+    // Contexto compartido entre los hilos recolector y procesador.
     MonitorContext contexto;
 
     strcpy(contexto.rutaPipe, rutaPipe);
     contexto.archivoConsolidado = archivoConsolidado;
 
+    // Inicializa estructuras principales del monitor.
     inicializarBuffer(&contexto.buffer, tamBuffer);
     inicializarEstadisticas(&contexto.estadisticas);
     inicializarConteoCategorias(&contexto.conteoCategorias);
@@ -65,6 +69,7 @@ int main(int argc, char *argv[]) {
     printf("Monitor esperando datos en: %s\n", rutaPipe);
     printf("Tamaño del buffer: %d lecturas\n", tamBuffer);
 
+    // Crea el hilo procesador, encargado de sacar datos del buffer y procesarlos.
     if (pthread_create(&procesador, NULL, hiloProcesador, &contexto) != 0) {
         printf("Error creando Hilo Procesador.\n");
 
@@ -76,6 +81,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Crea el hilo recolector, encargado de leer datos desde el pipe.
     if (pthread_create(&recolector, NULL, hiloRecolector, &contexto) != 0) {
         printf("Error creando Hilo Recolector.\n");
 
@@ -90,6 +96,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Espera a que ambos hilos terminen.
     pthread_join(recolector, NULL);
     pthread_join(procesador, NULL);
 
@@ -97,9 +104,11 @@ int main(int argc, char *argv[]) {
 
     printf("\nArchivo consolidado creado: %s\n", ARCHIVO_CONSOLIDADO);
 
+    // Muestra los resultados finales.
     imprimirResumen(contexto.estadisticas);
     imprimirCategorias(contexto.conteoCategorias);
 
+    // Libera recursos utilizados por el programa.
     destruirBuffer(&contexto.buffer);
 
     sem_close(semaforo);
@@ -121,6 +130,7 @@ int leerArgumentosMonitor(
 
     int opcion;
 
+    // Procesa las opciones -b y -p recibidas por consola.
     while ((opcion = getopt(argc, argv, "b:p:")) != -1) {
         switch (opcion) {
             case 'b':
@@ -136,10 +146,12 @@ int leerArgumentosMonitor(
         }
     }
 
+    // Valida que el tamaño del buffer y el nombre del pipe sean correctos.
     if (*tamBuffer <= 0 || pipeNombre == NULL) {
         return -1;
     }
 
+    // Construye la ruta completa del pipe dentro de /tmp.
     int resultado = snprintf(rutaPipe, MAX_RUTA_PIPE, "/tmp/%s", pipeNombre);
 
     if (resultado < 0 || resultado >= MAX_RUTA_PIPE) {
@@ -151,7 +163,9 @@ int leerArgumentosMonitor(
 }
 
 int crearPipeNominal(const char *rutaPipe) {
+    // Crea un FIFO para comunicación entre procesos.
     if (mkfifo(rutaPipe, 0666) == -1) {
+        // Si ya existe, no se considera error.
         if (errno != EEXIST) {
             perror("Error creando pipe nominal");
             return -1;
@@ -162,6 +176,7 @@ int crearPipeNominal(const char *rutaPipe) {
 }
 
 void inicializarBuffer(BufferEstaciones *buffer, int capacidad) {
+    // Reserva memoria para almacenar las lecturas del buffer.
     buffer->datos = malloc(sizeof(Estacion) * capacidad);
 
     if (buffer->datos == NULL) {
@@ -169,18 +184,21 @@ void inicializarBuffer(BufferEstaciones *buffer, int capacidad) {
         exit(1);
     }
 
+    // Inicializa los valores del buffer circular.
     buffer->capacidad = capacidad;
     buffer->inicio = 0;
     buffer->fin = 0;
     buffer->cantidad = 0;
     buffer->terminado = 0;
 
+    // Inicializa herramientas de sincronización entre hilos.
     pthread_mutex_init(&buffer->mutex, NULL);
     pthread_cond_init(&buffer->noLleno, NULL);
     pthread_cond_init(&buffer->noVacio, NULL);
 }
 
 void destruirBuffer(BufferEstaciones *buffer) {
+    // Libera memoria y destruye mecanismos de sincronización.
     free(buffer->datos);
 
     pthread_mutex_destroy(&buffer->mutex);
@@ -191,14 +209,17 @@ void destruirBuffer(BufferEstaciones *buffer) {
 void insertarBuffer(BufferEstaciones *buffer, Estacion estacion) {
     pthread_mutex_lock(&buffer->mutex);
 
+    // Si el buffer está lleno, el hilo espera hasta que haya espacio.
     while (buffer->cantidad == buffer->capacidad) {
         pthread_cond_wait(&buffer->noLleno, &buffer->mutex);
     }
 
+    // Inserta la lectura en el buffer circular.
     buffer->datos[buffer->fin] = estacion;
     buffer->fin = (buffer->fin + 1) % buffer->capacidad;
     buffer->cantidad++;
 
+    // Avisa al procesador que ya hay datos disponibles.
     pthread_cond_signal(&buffer->noVacio);
     pthread_mutex_unlock(&buffer->mutex);
 }
@@ -206,19 +227,23 @@ void insertarBuffer(BufferEstaciones *buffer, Estacion estacion) {
 bool sacarBuffer(BufferEstaciones *buffer, Estacion *estacion) {
     pthread_mutex_lock(&buffer->mutex);
 
+    // Si el buffer está vacío, espera a que lleguen datos o a que finalice.
     while (buffer->cantidad == 0 && !buffer->terminado) {
         pthread_cond_wait(&buffer->noVacio, &buffer->mutex);
     }
 
+    // Si ya no hay datos y el recolector terminó, se finaliza el procesamiento.
     if (buffer->cantidad == 0 && buffer->terminado) {
         pthread_mutex_unlock(&buffer->mutex);
         return false;
     }
 
+    // Extrae una lectura del buffer circular.
     *estacion = buffer->datos[buffer->inicio];
     buffer->inicio = (buffer->inicio + 1) % buffer->capacidad;
     buffer->cantidad--;
 
+    // Avisa al recolector que hay espacio disponible.
     pthread_cond_signal(&buffer->noLleno);
     pthread_mutex_unlock(&buffer->mutex);
 
@@ -228,8 +253,10 @@ bool sacarBuffer(BufferEstaciones *buffer, Estacion *estacion) {
 void finalizarBuffer(BufferEstaciones *buffer) {
     pthread_mutex_lock(&buffer->mutex);
 
+    // Marca que ya no se insertarán más datos.
     buffer->terminado = 1;
 
+    // Despierta al procesador si estaba esperando datos.
     pthread_cond_broadcast(&buffer->noVacio);
 
     pthread_mutex_unlock(&buffer->mutex);
@@ -238,6 +265,7 @@ void finalizarBuffer(BufferEstaciones *buffer) {
 void *hiloRecolector(void *arg) {
     MonitorContext *contexto = (MonitorContext *) arg;
 
+    // Abre el pipe en modo lectura.
     int fdPipe = open(contexto->rutaPipe, O_RDONLY);
 
     if (fdPipe == -1) {
@@ -246,6 +274,7 @@ void *hiloRecolector(void *arg) {
         pthread_exit(NULL);
     }
 
+    // Convierte el descriptor del pipe a FILE* para leer con fgets.
     FILE *pipe = fdopen(fdPipe, "r");
 
     if (pipe == NULL) {
@@ -257,11 +286,13 @@ void *hiloRecolector(void *arg) {
 
     char linea[MAX_LINEA];
 
+    // Lee cada línea recibida desde el pipe.
     while (fgets(linea, sizeof(linea), pipe) != NULL) {
         linea[strcspn(linea, "\n")] = '\0';
 
         Estacion estacion;
 
+        // Convierte la línea CSV en una estructura Estacion.
         if (!convertirLineaAEstacion(linea, &estacion)) {
             printf("Línea inválida recibida: %s\n", linea);
             continue;
@@ -276,11 +307,13 @@ void *hiloRecolector(void *arg) {
             estacion.hora
         );
 
+        // Envía la lectura al buffer para que el procesador la consuma.
         insertarBuffer(&contexto->buffer, estacion);
     }
 
     fclose(pipe);
 
+    // Indica que ya no llegarán más lecturas.
     finalizarBuffer(&contexto->buffer);
 
     pthread_exit(NULL);
@@ -291,6 +324,7 @@ void *hiloProcesador(void *arg) {
 
     Estacion estacion;
 
+    // Procesa lecturas mientras existan datos en el buffer.
     while (sacarBuffer(&contexto->buffer, &estacion)) {
         printf(
             "[Procesador] Procesando: %s,%d,%d,%d,%s\n",
@@ -301,6 +335,7 @@ void *hiloProcesador(void *arg) {
             estacion.hora
         );
 
+        // Guarda la lectura en el archivo consolidado.
         fprintf(
             contexto->archivoConsolidado,
             "LECTURA,%s,%d,%d,%d,%s\n",
@@ -313,6 +348,7 @@ void *hiloProcesador(void *arg) {
 
         fflush(contexto->archivoConsolidado);
 
+        // Actualiza estadísticas y categorías meteorológicas.
         actualizarEstadisticas(&contexto->estadisticas, estacion);
         clasificarLectura(estacion, &contexto->conteoCategorias);
     }
@@ -323,15 +359,18 @@ void *hiloProcesador(void *arg) {
 int convertirLineaAEstacion(const char *linea, Estacion *estacion) {
     char copia[MAX_LINEA];
 
+    // Se copia la línea porque strtok modifica el texto original.
     strncpy(copia, linea, sizeof(copia));
     copia[sizeof(copia) - 1] = '\0';
 
+    // Se separa la línea usando comas.
     char *nombre = strtok(copia, ",");
     char *humedad = strtok(NULL, ",");
     char *rocio = strtok(NULL, ",");
     char *presion = strtok(NULL, ",");
     char *hora = strtok(NULL, ",");
 
+    // Valida que la línea tenga todos los campos esperados.
     if (nombre == NULL ||
         humedad == NULL ||
         rocio == NULL ||
@@ -341,6 +380,7 @@ int convertirLineaAEstacion(const char *linea, Estacion *estacion) {
         return 0;
     }
 
+    // Copia los datos de texto y convierte los valores numéricos.
     strncpy(estacion->nombreEstacion, nombre, sizeof(estacion->nombreEstacion));
     estacion->nombreEstacion[sizeof(estacion->nombreEstacion) - 1] = '\0';
 
@@ -355,6 +395,7 @@ int convertirLineaAEstacion(const char *linea, Estacion *estacion) {
 }
 
 void inicializarEstadisticas(Estadisticas *estadisticas) {
+    // Inicializa acumuladores y valores de control.
     estadisticas->cantidad = 0;
 
     estadisticas->sumaHumedad = 0;
@@ -372,6 +413,7 @@ void inicializarEstadisticas(Estadisticas *estadisticas) {
 }
 
 void actualizarEstadisticas(Estadisticas *estadisticas, Estacion estacion) {
+    // En la primera lectura, se inicializan mínimos y máximos.
     if (estadisticas->cantidad == 0) {
         estadisticas->minHumedad = estacion.humedad;
         estadisticas->maxHumedad = estacion.humedad;
@@ -383,10 +425,12 @@ void actualizarEstadisticas(Estadisticas *estadisticas, Estacion estacion) {
         estadisticas->maxPresion = estacion.presion;
     }
 
+    // Acumula valores para calcular promedios.
     estadisticas->sumaHumedad += estacion.humedad;
     estadisticas->sumaRocio += estacion.rocio;
     estadisticas->sumaPresion += estacion.presion;
 
+    // Actualiza mínimos y máximos.
     if (estacion.humedad < estadisticas->minHumedad) {
         estadisticas->minHumedad = estacion.humedad;
     }
@@ -415,11 +459,13 @@ void actualizarEstadisticas(Estadisticas *estadisticas, Estacion estacion) {
 }
 
 void imprimirResumen(Estadisticas estadisticas) {
+    // Evita dividir entre cero si no se recibieron datos.
     if (estadisticas.cantidad == 0) {
         printf("No se recibieron datos para calcular estadísticas.\n");
         return;
     }
 
+    // Calcula promedios.
     double promedioHumedad = (double) estadisticas.sumaHumedad / estadisticas.cantidad;
     double promedioRocio = (double) estadisticas.sumaRocio / estadisticas.cantidad;
     double promedioPresion = (double) estadisticas.sumaPresion / estadisticas.cantidad;
@@ -447,6 +493,7 @@ void imprimirResumen(Estadisticas estadisticas) {
 }
 
 void inicializarConteoCategorias(ConteoCategorias *conteo) {
+    // Inicializa el contador de cada categoría.
     conteo->lluvioso = 0;
     conteo->nublado = 0;
     conteo->fresco = 0;
@@ -454,6 +501,7 @@ void inicializarConteoCategorias(ConteoCategorias *conteo) {
 }
 
 void clasificarLectura(Estacion estacion, ConteoCategorias *conteo) {
+    // Clasifica la lectura según humedad, rocío y presión.
     if (estacion.humedad > 90 &&
         estacion.rocio > 9 &&
         estacion.presion < 750) {
@@ -493,6 +541,7 @@ void imprimirCategorias(ConteoCategorias conteo) {
 
     printf("\nCategoría predominante: ");
 
+    // Determina la categoría más frecuente entre lluvioso, nublado y fresco.
     if (conteo.lluvioso == 0 &&
         conteo.nublado == 0 &&
         conteo.fresco == 0) {
