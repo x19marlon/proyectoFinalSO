@@ -347,9 +347,19 @@ int convertirLineaAEstacion(const char *linea, Estacion *estacion) {
     estacion->humedad = atoi(humedad);
     estacion->rocio = atoi(rocio);
     estacion->presion = atoi(presion);
-
-    strncpy(estacion->hora, hora, sizeof(estacion->hora));
+    
+    bool valido = (estacion->humedad >= 0 && estacion->humedad <= 100) &&
+                   (estacion->rocio >= 0 && estacion->rocio <= 100) &&
+                   (estacion->presion > 0);
+    if (valido) {
+         strncpy(estacion->hora, hora, sizeof(estacion->hora));
     estacion->hora[sizeof(estacion->hora) - 1] = '\0';
+    }
+    else {
+        printf("Valores fuera de rango en línea: %s\n", linea);
+        return 0;
+    }          
+   
 
     return 1;
 }
